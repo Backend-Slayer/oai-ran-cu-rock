@@ -1,71 +1,137 @@
-name: oai-ran-cu
-base: ubuntu@24.04
+name: oai-cu-72x
+base: ubuntu@22.04
 version: '2.2.0'
-summary: OAI RAN CU ROCK
+summary: OAI RAN DU (7.2x split) ROCK
 license: Apache-2.0
-description: Container image for the OAI RAN Central Unit (CU).
+description: >
+  Container image for the OAI RAN Distributed Unit (DU) using 7.2x split with
+  ORAN Fronthaul and DPDK.
+
 platforms:
   amd64:
 
 environment:
   DEBIAN_FRONTEND: noninteractive
-  LD_LIBRARY_PATH: "/usr/lib/x86_64-linux-gnu:/usr/local/lib"
-  OAI_GDBSTACKS: "1"
+  LD_LIBRARY_PATH: "/usr/local/lib:/usr/local/lib64"
   TZ: UTC
 
 parts:
-  cu:
+  cu-7-2x:
     plugin: nil
+
+    # We retrieve OAI from Git. The "v${CRAFT_PROJECT_VERSION}" can be replaced
+    # or pinned to a specific branch/tag if desired.
     source: https://gitlab.eurecom.fr/oai/openairinterface5g.git
     source-type: git
     source-tag: v${CRAFT_PROJECT_VERSION}
+
+    # Environment vars used for building the ORAN FHI library.
     build-environment:
-      - BUILD_UHD_FROM_SOURCE: "True"
-      - UHD_VERSION: "4.7.0.0"
-    overlay-packages:
-      - gdb
-      - libconfig9
-      - libsctp1
+      - RTE_SDK: "$CRAFT_PART_BUILD/dpdk-stable-20.11.9"
+      - XRAN_DIR: "$CRAFT_PART_BUILD/phy/fhi_lib"
+
+    # Packages needed to compile everything. Some come from the
+    # official OAI and DPDK instructions. Adjust as needed.
     build-packages:
+      - ca-certificates
       - g++-12
       - gcc-12
-    override-build: |
-      update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 --slave /usr/bin/g++ g++ /usr/bin/g++-12
-      /bin/sh oaienv
-      cd cmake_targets && mkdir -p log
-      ./build_oai -I -w USRP --install-optional-packages
-      ./build_oai -c --ninja \
-      --gNB \
-      --build-lib "telnetsrv enbscope uescope nrscope" \
-      -w USRP -t Ethernet \
-      --build-e2 --cmake-opt -DXAPP_MULTILANGUAGE=OFF \
-      --noavx512 \
-      --cmake-opt -DCMAKE_C_FLAGS="-Werror" --cmake-opt -DCMAKE_CXX_FLAGS="-Werror"
-      
-      cp -r ran_build/build $CRAFT_PART_INSTALL
-    organize:
-      build/liboai_eth_transpro.so: usr/local/lib/liboai_eth_transpro.so
-      build/libcoding.so: usr/local/lib/libcoding.so
-      build/libparams_libconfig.so: usr/local/lib/libparams_libconfig.so
-      build/libdfts.so: usr/local/lib/libdfts.so
-      build/libldpc.so: usr/local/lib/libldpc.so
-      build/libldpc_optim.so: usr/local/lib/libldpc_optim.so
-      build/libldpc_optim8seg.so: usr/local/lib/libldpc_optim8seg.so
-      build/libldpc_orig.so: usr/local/lib/libldpc_orig.so
-      build/libtelnetsrv.so: usr/local/lib/libtelnetsrv.so
-      build/libtelnetsrv_ci.so: usr/local/lib/libtelnetsrv_ci.so
-      build/nr-softmodem: opt/oai-gnb/bin/nr-softmodem
-    stage:
-      - usr/local/lib/*
-      - opt/oai-gnb/bin/*
+      - make
+      - cmake
+      - git
+      - wget
+      - meson
+      - ninja-build
+      - xz-utils
+      - libnuma-dev
+      - libelf-dev
+      - pkg-config
+      - python3
+      - python3-dev
+      - python3-mako
+      - python3-numpy
+      - python3-requests
+      - python3-scipy
+      - python3-setuptools
+      - python3-ruamel.yaml
+      - build-essential
+      - ccache
+      - cpufrequtils
+      - doxygen
+      - ethtool
+      - inetutils-tools
+      - libboost-all-dev
+      - libncurses-dev
+      - libusb-1.0-0-dev
+      - libusb-dev
 
-  tools:
-    after:
-      - cu
-    plugin: nil
+    # Packages that should end up in the final container image at runtime.
     stage-packages:
       - iperf
       - iperf3
       - iproute2
       - iputils-ping
       - net-tools
+      - libsctp1
+      - libconfig9
+
+    override-build: |
+      set -ex
+
+      # If PKG_CONFIG_PATH wasn't set before, define it safely.
+      export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-}:/usr/local/lib64/pkgconfig"
+
+      # Switch to gcc-12/g++-12 (ensuring we compile with them).
+      update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 \
+        --slave /usr/bin/g++ g++ /usr/bin/g++-12
+
+      # 1) Build and install DPDK 20.11.9
+      wget http://fast.dpdk.org/rel/dpdk-20.11.9.tar.xz
+      tar xvf dpdk-20.11.9.tar.xz
+      cd dpdk-stable-20.11.9
+      meson build
+      ninja -C build
+      ninja -C build install
+      ldconfig
+      cd ..
+
+      # 2) Install the standard OAI dependencies (similar to: ./build_oai -I).
+      cd cmake_targets
+      ./build_oai -I
+      cd ..
+
+      # 3) Build the ORAN FHI library:
+      #    a) Clone the O-RAN PHY repository
+      #    b) Checkout the correct branch/tag
+      #    c) Apply the OAI patch from openairinterface5g
+      git clone https://gerrit.o-ran-sc.org/r/o-du/phy.git
+      cd phy
+      git checkout oran_e_maintenance_release_v1.0
+      git apply ../cmake_targets/tools/oran_fhi_integration_patches/E/oaioran_E.patch
+
+      #    d) Build the fhi_lib as a shared library (XRAN_LIB_SO=1)
+      cd fhi_lib/lib
+      make clean
+      make XRAN_LIB_SO=1
+      cd ../../
+
+      # 4) Build OAI in "7.2x" mode for the DU with ORAN FHI
+      #    We pass '-t oran_fhlib_5g' and specify where xran libs are located.
+      cd ../cmake_targets
+      ./build_oai --gNB --ninja -t oran_fhlib_5g \
+        --cmake-opt -Dxran_LOCATION=$CRAFT_PART_BUILD/phy/fhi_lib/lib
+
+      # 5) Install the DU binaries / libs into the final image
+      mkdir -p "$CRAFT_PART_INSTALL/opt/oai-cu/bin"
+      cp ran_build/build/nr-softmodem "$CRAFT_PART_INSTALL/opt/oai-cu/bin/"
+      
+      # Copy the ORAN shared library
+      mkdir -p "$CRAFT_PART_INSTALL/usr/local/lib"
+      cp ran_build/build/liboran_fhlib_5g.so "$CRAFT_PART_INSTALL/usr/local/lib/"
+
+    stage:
+      - usr/local/lib/*.so*
+      - opt/oai-cu/bin/*
+    organize:
+      # Rename the DU binary to a friendlier name
+      opt/oai-cu/bin/nr-softmodem: opt/oai-cu/bin/oai_cu_7.2x
